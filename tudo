@@ -1,0 +1,333 @@
+import "./style.css";
+import Papa from "papaparse";
+import { initializeApp } from "firebase/app";
+import { getDatabase, ref, set, push, get, child } from "firebase/database";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCWUyoWsdhA2H2ScQFzmEQTItH9Rfxgsrc",
+  authDomain: "ds-udia44.firebaseapp.com",
+  databaseURL: "https://ds-udia44-default-rtdb.firebaseio.com",
+  projectId: "ds-udia44",
+  storageBucket: "ds-udia44.firebasestorage.app",
+  messagingSenderId: "237331800146",
+  appId: "1:237331800146:web:848273f9758e64d1897f8b",
+  measurementId: "G-XLSLN8XT31"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+const EXCLUDED_REASONS = [
+  "DO NOT DELIVER",
+  "PARCEL DAMAGED",
+  "PARCEL LOST",
+  "UNFORESSEN"
+];
+
+document.querySelector("#app").innerHTML = `
+  <main class="container">
+    <header class="hero">
+      <h1>📊 DS UDIA44</h1>
+      <p>Análise OnHold, Delivering, Carregados e Performance</p>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h2>📦 Importar Carregados</h2>
+        <input type="file" id="fileCarregados" accept=".csv" />
+        <button id="btnCarregados">Importar Carregados</button>
+      </div>
+
+      <div class="card">
+        <h2>🚚 Importar OnHold / Delivering</h2>
+        <input type="file" id="fileOnhold" accept=".csv" />
+        <button id="btnOnhold">Importar OnHold / Delivering</button>
+      </div>
+    </section>
+
+    <section class="resumo">
+      <div><span>Pacotes</span><strong id="totalPacotes">0</strong></div>
+      <div><span>OnHold</span><strong id="totalOnhold">0</strong></div>
+      <div><span>Delivering</span><strong id="totalDelivering">0</strong></div>
+      <div><span>Motoristas</span><strong id="totalMotoristas">0</strong></div>
+    </section>
+
+    <section class="card">
+      <h2>🏆 Performance dos Motoristas</h2>
+      <input id="busca" placeholder="Buscar por motorista, ID ou rota..." />
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Motorista</th>
+              <th>Rota</th>
+              <th>Pacotes</th>
+              <th>OnHold</th>
+              <th>Delivering</th>
+              <th>% OnHold</th>
+              <th>% Delivering</th>
+              <th>DS %</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>🕘 Histórico</h2>
+      <div id="historico"></div>
+    </section>
+  </main>
+`;
+
+document.querySelector("#btnCarregados").onclick = importarCarregados;
+document.querySelector("#btnOnhold").onclick = importarOnholdDelivering;
+document.querySelector("#busca").oninput = carregarDashboard;
+
+function lerCSV(file) {
+  return new Promise((resolve, reject) => {
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: r => resolve(r.data),
+      error: reject
+    });
+  });
+}
+
+function txt(v) {
+  return String(v ?? "").trim();
+}
+
+function num(v) {
+  const n = Number(String(v ?? "").replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function keyFirebase(...partes) {
+  return partes
+    .map(p => txt(p).toUpperCase().replace(/[.#$/[\]]/g, "-"))
+    .join("__");
+}
+
+async function importarCarregados() {
+  const file = document.querySelector("#fileCarregados").files[0];
+  if (!file) return alert("Selecione o arquivo CARREGADOS.");
+
+  const rows = await lerCSV(file);
+  const agrupado = {};
+
+  rows.forEach(row => {
+    const taskId = txt(row["Task ID"]);
+    const rota = txt(row["Corridor-Cage/Route"]);
+    const spx = txt(row["SPX tracking num"]);
+    const motorista = txt(row["Driver name"]);
+    const driverId = txt(row["Driver ID"]);
+    const data = txt(row["Delivery Date"]);
+    const qtd = num(row["Number of order/TO"]);
+
+    if (!taskId || !rota || !driverId) return;
+
+    const key = keyFirebase(taskId, rota, driverId, data);
+
+    if (!agrupado[key]) {
+      agrupado[key] = {
+        taskId,
+        rota,
+        motorista,
+        driverId,
+        data,
+        qtdPacotesCarregados: qtd,
+        pacotesSPX: {}
+      };
+    }
+
+    if (spx) agrupado[key].pacotesSPX[spx] = true;
+  });
+
+  Object.keys(agrupado).forEach(key => {
+    agrupado[key].qtdSPXUnicos = Object.keys(agrupado[key].pacotesSPX).length;
+    delete agrupado[key].pacotesSPX;
+  });
+
+  await set(ref(db, "bases/carregados"), agrupado);
+
+  await push(ref(db, "historicoImportacoes"), {
+    tipo: "CARREGADOS",
+    arquivo: file.name,
+    dataHora: new Date().toISOString(),
+    linhasOriginais: rows.length,
+    registrosUnicos: Object.keys(agrupado).length,
+    totalPacotes: Object.values(agrupado).reduce(
+      (s, i) => s + i.qtdPacotesCarregados,
+      0
+    )
+  });
+
+  alert("Carregados importado sem duplicar.");
+  carregarDashboard();
+}
+
+async function importarOnholdDelivering() {
+  const file = document.querySelector("#fileOnhold").files[0];
+  if (!file) return alert("Selecione o arquivo OnHold / Delivering.");
+
+  const rows = await lerCSV(file);
+
+  const onhold = {};
+  const delivering = {};
+  const cep = {};
+  const location = {
+    HOME: 0,
+    OFFICE: 0,
+    NAO_IDENTIFICADO: 0
+  };
+
+  rows.forEach(row => {
+    const locationType = txt(row["Location Type"]);
+    const zipcode = txt(row["Buyer Address Zipcode"]);
+    const driverId = txt(row["Driver ID"]);
+    const motorista = txt(row["Driver Name"]);
+    const onHoldTime = txt(row["OnHold Time"]);
+    const reason = txt(row["OnHold Reason"]).toUpperCase();
+    const status = txt(row["Order Status"]).toUpperCase();
+
+    if (!driverId && !motorista) return;
+
+    const key = keyFirebase(driverId, motorista);
+
+    if (onHoldTime && !EXCLUDED_REASONS.includes(reason)) {
+      if (!onhold[key]) {
+        onhold[key] = { driverId, motorista, qtdOnhold: 0 };
+      }
+
+      onhold[key].qtdOnhold++;
+
+      if (zipcode) cep[zipcode] = (cep[zipcode] || 0) + 1;
+
+      const loc = locationType.toUpperCase();
+      if (loc === "HOME") location.HOME++;
+      else if (loc === "OFFICE") location.OFFICE++;
+      else location.NAO_IDENTIFICADO++;
+    }
+
+    if (status === "DELIVERING") {
+      if (!delivering[key]) {
+        delivering[key] = { driverId, motorista, qtdDelivering: 0 };
+      }
+
+      delivering[key].qtdDelivering++;
+    }
+  });
+
+  await set(ref(db, "analises/onholdPorMotorista"), onhold);
+  await set(ref(db, "analises/deliveringPorMotorista"), delivering);
+  await set(ref(db, "analises/onholdPorCEP"), cep);
+  await set(ref(db, "analises/onholdPorLocation"), location);
+
+  await push(ref(db, "historicoImportacoes"), {
+    tipo: "ONHOLD_DELIVERING",
+    arquivo: file.name,
+    dataHora: new Date().toISOString(),
+    linhasOriginais: rows.length,
+    totalOnhold: Object.values(onhold).reduce((s, i) => s + i.qtdOnhold, 0),
+    totalDelivering: Object.values(delivering).reduce((s, i) => s + i.qtdDelivering, 0)
+  });
+
+  alert("OnHold / Delivering importado.");
+  carregarDashboard();
+}
+
+async function carregarDashboard() {
+  const snap = await get(child(ref(db), "/"));
+  if (!snap.exists()) return;
+
+  const data = snap.val();
+
+  const carregados = data.bases?.carregados || {};
+  const onhold = data.analises?.onholdPorMotorista || {};
+  const delivering = data.analises?.deliveringPorMotorista || {};
+  const historico = data.historicoImportacoes || {};
+
+  const linhas = Object.values(carregados).map(c => {
+    const key = keyFirebase(c.driverId, c.motorista);
+
+    const pacotes = c.qtdPacotesCarregados || 0;
+    const qtdOnhold = onhold[key]?.qtdOnhold || 0;
+    const qtdDelivering = delivering[key]?.qtdDelivering || 0;
+
+    const percOnhold = pacotes ? (qtdOnhold / pacotes) * 100 : 0;
+    const percDelivering = pacotes ? (qtdDelivering / pacotes) * 100 : 0;
+    const ds = 100 - (percOnhold + percDelivering);
+
+    return {
+      driverId: c.driverId,
+      motorista: c.motorista,
+      rota: c.rota,
+      pacotes,
+      qtdOnhold,
+      qtdDelivering,
+      percOnhold,
+      percDelivering,
+      ds
+    };
+  });
+
+  const busca = txt(document.querySelector("#busca").value).toUpperCase();
+
+  const filtradas = linhas
+    .filter(i => `${i.driverId} ${i.motorista} ${i.rota}`.toUpperCase().includes(busca))
+    .sort((a, b) => a.ds - b.ds);
+
+  document.querySelector("#totalPacotes").innerText =
+    linhas.reduce((s, i) => s + i.pacotes, 0);
+
+  document.querySelector("#totalOnhold").innerText =
+    linhas.reduce((s, i) => s + i.qtdOnhold, 0);
+
+  document.querySelector("#totalDelivering").innerText =
+    linhas.reduce((s, i) => s + i.qtdDelivering, 0);
+
+  document.querySelector("#totalMotoristas").innerText =
+    new Set(linhas.map(i => i.driverId)).size;
+
+  document.querySelector("#tbody").innerHTML = filtradas.map(i => {
+    const classe = i.ds < 90 ? "ruim" : i.ds <= 95 ? "medio" : "bom";
+
+    return `
+      <tr>
+        <td>${i.driverId}</td>
+        <td>${i.motorista}</td>
+        <td>${i.rota}</td>
+        <td>${i.pacotes}</td>
+        <td>${i.qtdOnhold}</td>
+        <td>${i.qtdDelivering}</td>
+        <td>${i.percOnhold.toFixed(2)}%</td>
+        <td>${i.percDelivering.toFixed(2)}%</td>
+        <td class="${classe}">${i.ds.toFixed(2)}%</td>
+      </tr>
+    `;
+  }).join("");
+
+  document.querySelector("#historico").innerHTML =
+    Object.values(historico)
+      .sort((a, b) => new Date(b.dataHora) - new Date(a.dataHora))
+      .map(h => `
+        <div class="hist">
+          <strong>${h.tipo}</strong>
+          <span>${h.arquivo}</span>
+          <small>${new Date(h.dataHora).toLocaleString("pt-BR")}</small>
+          <p>
+            Linhas: ${h.linhasOriginais || 0} |
+            Únicos: ${h.registrosUnicos || "-"} |
+            Pacotes: ${h.totalPacotes || "-"} |
+            OnHold: ${h.totalOnhold || "-"} |
+            Delivering: ${h.totalDelivering || "-"}
+          </p>
+        </div>
+      `).join("");
+}
+
+carregarDashboard();
